@@ -17,6 +17,7 @@ The default is port `8787`; override it with `PORT=9000 ./start.sh`. Runtime sta
 Open `http://localhost:8787` locally, or `http://<this-machine-LAN-IPv4>:8787` from the LAN.
 
 - `GET /api/runs` lists readable canonical records; it accepts no query parameters.
+- Click an agent in the UI to open its live mission and recent activity/tool-call timeline. The detail view refreshes every two seconds through `GET /api/runs/<project>/<runId>/agents/<agentId>`.
 - `POST /api/runs/stop` and `POST /api/runs/delete` accept JSON only: `{"project":"…","runId":"…"}`. Both require an `Origin` exactly matching the server origin. Project and run IDs are strict simple identifiers, then resolved only below the fixed workflow data root; arbitrary paths are never accepted.
 
 ## Destructive-control semantics
