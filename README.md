@@ -18,7 +18,8 @@ Open `http://localhost:8787` locally, or `http://<this-machine-LAN-IPv4>:8787` f
 
 - `GET /api/runs` lists readable canonical records; it accepts no query parameters.
   Each run includes an ordered phase timeline from its declared `phases` array. Completed phases are green, the current phase is blue, and declared future phases remain visible as subdued `pending · not started` steps. Records without a usable phase array show a harmless empty-state message.
-- Click an agent in the UI to open its live mission and recent activity/tool-call timeline. The detail view refreshes every two seconds through `GET /api/runs/<project>/<runId>/agents/<agentId>`.
+- Every workflow card lists the distinct models recorded for its agents; every agent row repeats its own compact model badge. Missing model fields are explicitly shown as `Not recorded`, rather than guessed.
+- Click an agent in the UI to open its live mission and recent activity/tool-call timeline. The detail view begins with a prominent, unambiguous “Model used by this agent” value and refreshes every two seconds through `GET /api/runs/<project>/<runId>/agents/<agentId>`.
 - `POST /api/runs/stop` and `POST /api/runs/delete` accept JSON only: `{"project":"…","runId":"…"}`. Both require an `Origin` exactly matching the server origin. Project and run IDs are strict simple identifiers, then resolved only below the fixed workflow data root; arbitrary paths are never accepted.
 
 ## Destructive-control semantics
