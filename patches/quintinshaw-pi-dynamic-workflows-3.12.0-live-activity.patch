@@ -1,0 +1,348 @@
+diff --git a/dist/task-panel.js b/dist/task-panel.js
+index 3538ef14fdfd0ef0107b6016b6de5ed5b3f57ea0..382ab98ccba1be54dd0f5b345ec147ffc493cadc 100644
+--- a/dist/task-panel.js
++++ b/dist/task-panel.js
+@@ -17,6 +17,8 @@ import { shortModel } from "./workflow-ui.js";
+ // it redraws identical content.
+ const RUN_EVENTS = [
+     "agentStart",
++    "agentHistory",
++    "agentHeartbeat",
+     "agentModel",
+     "agentEnd",
+     "phase",
+diff --git a/dist/workflow-manager.js b/dist/workflow-manager.js
+index 23d9cbe17028cdaa69b23b01a6bb8cfadd450354..ac0a00e4e5493b03a56498f5f5477595f28339df 100644
+--- a/dist/workflow-manager.js
++++ b/dist/workflow-manager.js
+@@ -133,6 +133,7 @@ export class WorkflowManager extends EventEmitter {
+         this.toolsets = options.toolsets;
+         this.excludeSubagentTools = options.excludeSubagentTools;
+         this.persistAgentSessions = options.persistAgentSessions ?? false;
++        this.heartbeatIntervalMs = Math.max(1000, options.heartbeatIntervalMs ?? 15000);
+         this.maxTerminalRunsInMemory = options.maxTerminalRunsInMemory ?? DEFAULT_MAX_TERMINAL_RUNS_IN_MEMORY;
+         this.persistence = createRunPersistence(this.cwd);
+         this.recoverStaleRuns();
+@@ -573,6 +574,7 @@ export class WorkflowManager extends EventEmitter {
+                 },
+                 onLog: (message) => {
+                     managed.snapshot.logs.push(message);
++                    this.schedulePersist(managed);
+                     this.emitLive(managed, "log", { runId: managed.runId, message });
+                     progress();
+                 },
+@@ -581,10 +583,12 @@ export class WorkflowManager extends EventEmitter {
+                     if (!managed.snapshot.phases.includes(title)) {
+                         managed.snapshot.phases.push(title);
+                     }
++                    this.schedulePersist(managed);
+                     this.emitLive(managed, "phase", { runId: managed.runId, title });
+                     progress();
+                 },
+                 onAgentStart: (event) => {
++                    const hadRunningAgent = managed.snapshot.agents.some((agent) => agent.status === "running");
+                     const id = managed.snapshot.agents.length + 1;
+                     const prior = event.replayed ? managed.replayedAgentStatesByCallId.get(event.id) : undefined;
+                     const priorSession = event.replayed ? managed.agentSessionsByCallId.get(event.id) : undefined;
+@@ -615,6 +619,11 @@ export class WorkflowManager extends EventEmitter {
+                     if (event.replayed && priorTimestamp)
+                         managed.replayedAgentCalls.add(event.id);
+                     managed.agentTimestampsByCallId.set(event.id, { ...timestamp });
++                    if (hadRunningAgent)
++                        this.schedulePersist(managed);
++                    else
++                        this.persistRun(managed);
++                    this.ensureHeartbeat(managed);
+                     this.emitLive(managed, "agentStart", { runId: managed.runId, ...event });
+                     progress();
+                 },
+@@ -627,8 +636,8 @@ export class WorkflowManager extends EventEmitter {
+                         return;
+                     }
+                     agent.model = event.model;
+-                    // No persistRun() here: this fires once per attempt, and the throttled
+-                    // progress persist plus every terminal persist already pick the field up.
++                    // Persist the resolved concrete model while the agent is still running.
++                    this.schedulePersist(managed);
+                     this.emitLive(managed, "agentModel", { runId: managed.runId, agentId: agent.id, ...event });
+                     progress();
+                 },
+@@ -698,6 +707,9 @@ export class WorkflowManager extends EventEmitter {
+                         managed.agentsById.delete(event.id);
+                     }
+                     this.emitLive(managed, "agentEnd", { runId: managed.runId, ...event });
++                    if (!managed.snapshot.agents.some((candidate) => candidate.status === "running")) {
++                        this.clearHeartbeat(managed);
++                    }
+                     progress();
+                 },
+                 onAgentHistory: (event) => {
+@@ -705,6 +717,7 @@ export class WorkflowManager extends EventEmitter {
+                     if (agent) {
+                         agent.history = event.history;
+                     }
++                    this.schedulePersist(managed);
+                     this.emitLive(managed, "agentHistory", { runId: managed.runId, agentId: agent?.id, ...event });
+                     progress();
+                 },
+@@ -745,6 +758,7 @@ export class WorkflowManager extends EventEmitter {
+             }
+             managed.status = "completed";
+             managed.result = result;
++            this.clearHeartbeat(managed);
+             // Gated the same way as disk/lease below (see emitLive()): a stale
+             // execution's "complete" would otherwise still deliver a result for a
+             // run that's been superseded or deleted (e.g. background result
+@@ -828,6 +842,7 @@ export class WorkflowManager extends EventEmitter {
+                 managed.status = "failed";
+             }
+             managed.error = terminalError;
++            this.clearHeartbeat(managed);
+             // Both branches gated via emitLive() (see its doc comment) — a stale
+             // execution's "paused"/"error" is equally misleading once superseded.
+             if (usageLimitPaused) {
+@@ -993,6 +1008,39 @@ export class WorkflowManager extends EventEmitter {
+     static PERSIST_THROTTLE_MS = 400;
+     /** Pending trailing-edge persist timers for high-frequency progress events, keyed by runId. */
+     persistTimers = new Map();
++    /** One bounded heartbeat per run, regardless of agent concurrency. */
++    heartbeatTimers = new Map();
++    ensureHeartbeat(managed) {
++        const existing = this.heartbeatTimers.get(managed.runId);
++        if (existing?.owner === managed)
++            return;
++        if (existing)
++            clearInterval(existing.timer);
++        const timer = setInterval(() => {
++            if (!this.isCurrent(managed) || managed.status !== "running") {
++                this.clearHeartbeat(managed);
++                return;
++            }
++            const active = managed.snapshot.agents.filter((agent) => agent.status === "running");
++            if (active.length === 0)
++                return;
++            this.schedulePersist(managed);
++            this.emitLive(managed, "agentHeartbeat", {
++                runId: managed.runId,
++                agentIds: active.map((agent) => agent.id),
++                at: new Date().toISOString(),
++            });
++        }, this.heartbeatIntervalMs);
++        timer.unref?.();
++        this.heartbeatTimers.set(managed.runId, { timer, owner: managed });
++    }
++    clearHeartbeat(managed) {
++        const entry = this.heartbeatTimers.get(managed.runId);
++        if (!entry || entry.owner !== managed)
++            return;
++        clearInterval(entry.timer);
++        this.heartbeatTimers.delete(managed.runId);
++    }
+     /**
+      * Coalesce rapid progress persists (currently: onAgentJournal, which fires
+      * once per completed agent and can burst under concurrency) to at most one
+@@ -1198,6 +1246,7 @@ export class WorkflowManager extends EventEmitter {
+         if (managed?.status !== "running")
+             return false;
+         managed.status = "paused";
++        this.clearHeartbeat(managed);
+         this.abortForLifecycleControl(managed, "pause");
+         this.emit("paused", { runId });
+         // Persist the requested lifecycle state immediately, but retain the lease
+@@ -1486,6 +1535,7 @@ export class WorkflowManager extends EventEmitter {
+             // small leak in exactly the class this manager otherwise bounds.
+             const hadNoPendingSettle = managed.status === "paused";
+             managed.status = "aborted";
++            this.clearHeartbeat(managed);
+             managed.error ??= new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, {
+                 recoverable: true,
+             });
+@@ -1575,6 +1625,7 @@ export class WorkflowManager extends EventEmitter {
+         if (managed) {
+             if (!managed.controller.signal.aborted)
+                 managed.controller.abort();
++            this.clearHeartbeat(managed);
+             this.releaseRunLease(managed);
+         }
+         this.runs.delete(runId);
+diff --git a/src/task-panel.ts b/src/task-panel.ts
+index 3363d425d29ac87bc5c58cc022bd157f9fcab74f..a426c2629306d913b009d87e916e7e73e2c603d9 100644
+--- a/src/task-panel.ts
++++ b/src/task-panel.ts
+@@ -32,6 +32,8 @@ import { shortModel } from "./workflow-ui.js";
+ // it redraws identical content.
+ const RUN_EVENTS = [
+   "agentStart",
++  "agentHistory",
++  "agentHeartbeat",
+   "agentModel",
+   "agentEnd",
+   "phase",
+diff --git a/src/workflow-manager.ts b/src/workflow-manager.ts
+index 710a1032d13efabb778d1f5b008ea12bd9779f34..f8f902e302905c21965ef15363714be6e109a466 100644
+--- a/src/workflow-manager.ts
++++ b/src/workflow-manager.ts
+@@ -330,6 +330,8 @@ export interface WorkflowManagerOptions {
+    * to observe eviction without creating dozens of runs.
+    */
+   maxTerminalRunsInMemory?: number;
++  /** Interval for persisting liveness while at least one agent is running. */
++  heartbeatIntervalMs?: number;
+ }
+ 
+ /** Options that a fresh extension generation may safely refresh on a live
+@@ -444,6 +446,7 @@ export class WorkflowManager extends EventEmitter {
+   private toolsets?: Record<string, () => ToolDefinition[]>;
+   private excludeSubagentTools?: string[];
+   private persistAgentSessions: boolean;
++  private heartbeatIntervalMs: number;
+ 
+   constructor(options: WorkflowManagerOptions = {}) {
+     super();
+@@ -461,6 +464,7 @@ export class WorkflowManager extends EventEmitter {
+     this.toolsets = options.toolsets;
+     this.excludeSubagentTools = options.excludeSubagentTools;
+     this.persistAgentSessions = options.persistAgentSessions ?? false;
++    this.heartbeatIntervalMs = Math.max(1000, options.heartbeatIntervalMs ?? 15_000);
+     this.maxTerminalRunsInMemory = options.maxTerminalRunsInMemory ?? DEFAULT_MAX_TERMINAL_RUNS_IN_MEMORY;
+     this.persistence = createRunPersistence(this.cwd);
+     this.recoverStaleRuns();
+@@ -931,6 +935,7 @@ export class WorkflowManager extends EventEmitter {
+         },
+         onLog: (message) => {
+           managed.snapshot.logs.push(message);
++          this.schedulePersist(managed);
+           this.emitLive(managed, "log", { runId: managed.runId, message });
+           progress();
+         },
+@@ -939,10 +944,12 @@ export class WorkflowManager extends EventEmitter {
+           if (!managed.snapshot.phases.includes(title)) {
+             managed.snapshot.phases.push(title);
+           }
++          this.schedulePersist(managed);
+           this.emitLive(managed, "phase", { runId: managed.runId, title });
+           progress();
+         },
+         onAgentStart: (event) => {
++          const hadRunningAgent = managed.snapshot.agents.some((agent) => agent.status === "running");
+           const id = managed.snapshot.agents.length + 1;
+           const prior = event.replayed ? managed.replayedAgentStatesByCallId.get(event.id) : undefined;
+           const priorSession = event.replayed ? managed.agentSessionsByCallId.get(event.id) : undefined;
+@@ -972,6 +979,9 @@ export class WorkflowManager extends EventEmitter {
+           managed.agentTimestamps.set(id, { ...timestamp });
+           if (event.replayed && priorTimestamp) managed.replayedAgentCalls.add(event.id);
+           managed.agentTimestampsByCallId.set(event.id, { ...timestamp });
++          if (hadRunningAgent) this.schedulePersist(managed);
++          else this.persistRun(managed);
++          this.ensureHeartbeat(managed);
+           this.emitLive(managed, "agentStart", { runId: managed.runId, ...event });
+           progress();
+         },
+@@ -984,8 +994,8 @@ export class WorkflowManager extends EventEmitter {
+             return;
+           }
+           agent.model = event.model;
+-          // No persistRun() here: this fires once per attempt, and the throttled
+-          // progress persist plus every terminal persist already pick the field up.
++          // Persist the resolved concrete model while the agent is still running.
++          this.schedulePersist(managed);
+           this.emitLive(managed, "agentModel", { runId: managed.runId, agentId: agent.id, ...event });
+           progress();
+         },
+@@ -1053,6 +1063,9 @@ export class WorkflowManager extends EventEmitter {
+             managed.agentsById.delete(event.id);
+           }
+           this.emitLive(managed, "agentEnd", { runId: managed.runId, ...event });
++          if (!managed.snapshot.agents.some((candidate) => candidate.status === "running")) {
++            this.clearHeartbeat(managed);
++          }
+           progress();
+         },
+         onAgentHistory: (event) => {
+@@ -1060,6 +1073,7 @@ export class WorkflowManager extends EventEmitter {
+           if (agent) {
+             agent.history = event.history;
+           }
++          this.schedulePersist(managed);
+           this.emitLive(managed, "agentHistory", { runId: managed.runId, agentId: agent?.id, ...event });
+           progress();
+         },
+@@ -1105,6 +1119,7 @@ export class WorkflowManager extends EventEmitter {
+ 
+       managed.status = "completed";
+       managed.result = result;
++      this.clearHeartbeat(managed);
+       // Gated the same way as disk/lease below (see emitLive()): a stale
+       // execution's "complete" would otherwise still deliver a result for a
+       // run that's been superseded or deleted (e.g. background result
+@@ -1197,6 +1212,7 @@ export class WorkflowManager extends EventEmitter {
+         managed.status = "failed";
+       }
+       managed.error = terminalError;
++      this.clearHeartbeat(managed);
+       // Both branches gated via emitLive() (see its doc comment) — a stale
+       // execution's "paused"/"error" is equally misleading once superseded.
+       if (usageLimitPaused) {
+@@ -1365,6 +1381,38 @@ export class WorkflowManager extends EventEmitter {
+   /** Pending trailing-edge persist timers for high-frequency progress events, keyed by runId. */
+   private persistTimers = new Map<string, ReturnType<typeof setTimeout>>();
+ 
++  /** One bounded heartbeat per run, regardless of agent concurrency. */
++  private heartbeatTimers = new Map<string, { timer: ReturnType<typeof setInterval>; owner: ManagedRun }>();
++
++  private ensureHeartbeat(managed: ManagedRun): void {
++    const existing = this.heartbeatTimers.get(managed.runId);
++    if (existing?.owner === managed) return;
++    if (existing) clearInterval(existing.timer);
++    const timer = setInterval(() => {
++      if (!this.isCurrent(managed) || managed.status !== "running") {
++        this.clearHeartbeat(managed);
++        return;
++      }
++      const active = managed.snapshot.agents.filter((agent) => agent.status === "running");
++      if (active.length === 0) return;
++      this.schedulePersist(managed);
++      this.emitLive(managed, "agentHeartbeat", {
++        runId: managed.runId,
++        agentIds: active.map((agent) => agent.id),
++        at: new Date().toISOString(),
++      });
++    }, this.heartbeatIntervalMs);
++    timer.unref?.();
++    this.heartbeatTimers.set(managed.runId, { timer, owner: managed });
++  }
++
++  private clearHeartbeat(managed: ManagedRun): void {
++    const entry = this.heartbeatTimers.get(managed.runId);
++    if (!entry || entry.owner !== managed) return;
++    clearInterval(entry.timer);
++    this.heartbeatTimers.delete(managed.runId);
++  }
++
+   /**
+    * Coalesce rapid progress persists (currently: onAgentJournal, which fires
+    * once per completed agent and can burst under concurrency) to at most one
+@@ -1575,6 +1623,7 @@ export class WorkflowManager extends EventEmitter {
+     if (managed?.status !== "running") return false;
+ 
+     managed.status = "paused";
++    this.clearHeartbeat(managed);
+     this.abortForLifecycleControl(managed, "pause");
+     this.emit("paused", { runId });
+     // Persist the requested lifecycle state immediately, but retain the lease
+@@ -1880,6 +1929,7 @@ export class WorkflowManager extends EventEmitter {
+       // small leak in exactly the class this manager otherwise bounds.
+       const hadNoPendingSettle = managed.status === "paused";
+       managed.status = "aborted";
++      this.clearHeartbeat(managed);
+       managed.error ??= new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, {
+         recoverable: true,
+       });
+@@ -1975,6 +2025,7 @@ export class WorkflowManager extends EventEmitter {
+     const managed = this.runs.get(runId);
+     if (managed) {
+       if (!managed.controller.signal.aborted) managed.controller.abort();
++      this.clearHeartbeat(managed);
+       this.releaseRunLease(managed);
+     }
+     this.runs.delete(runId);

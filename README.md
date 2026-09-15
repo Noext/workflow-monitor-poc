@@ -14,7 +14,7 @@ The default is port `8787`; override it with `PORT=9000 ./start.sh`. By default 
 
 ## Live activity compatibility
 
-The official `pi-dynamic-workflows-mingrui@3.3.1` package may not persist an agent's compact history until that agent finishes. This repository includes a guarded, reproducible extension patch for live history/model/heartbeat persistence. See [`docs/dynamic-workflows-live-activity-patch.md`](docs/dynamic-workflows-live-activity-patch.md) before applying it.
+The official `@quintinshaw/pi-dynamic-workflows@3.12.0` package may not persist an agent's compact history frequently enough for an external monitor. This repository includes a guarded, reproducible extension patch for live history/model/heartbeat persistence. See [`docs/dynamic-workflows-live-activity-patch.md`](docs/dynamic-workflows-live-activity-patch.md) before applying it.
 
 ## Access and API
 
