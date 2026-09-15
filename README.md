@@ -12,6 +12,10 @@ cd /root/Dev/workflow-monitor-poc
 
 The default is port `8787`; override it with `PORT=9000 ./start.sh`. By default the monitor reads the current OS user's `~/.pi/workflows/projects` directory. For a custom Pi home or container mount, use `WORKFLOW_DATA_ROOT=/path/to/.pi/workflows/projects ./start.sh`. Runtime state is recorded in `workflow-monitor.pid`; output is appended to `workflow-monitor.log`. `start.sh` refuses to start a duplicate live process.
 
+## Live activity compatibility
+
+The official `pi-dynamic-workflows-mingrui@3.3.1` package may not persist an agent's compact history until that agent finishes. This repository includes a guarded, reproducible extension patch for live history/model/heartbeat persistence. See [`docs/dynamic-workflows-live-activity-patch.md`](docs/dynamic-workflows-live-activity-patch.md) before applying it.
+
 ## Access and API
 
 Open `http://localhost:8787` locally, or `http://<this-machine-LAN-IPv4>:8787` from the LAN.
